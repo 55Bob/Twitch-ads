@@ -1,0 +1,671 @@
+twitch-videoad.js texte/javascript
+(fonction() {
+    si ( /(^|\.)twitch\.tv$/.test(document.location.hostname) === faux ) { retour; }
+    fonction déclarerOptions(portée) {
+        // Options / globales
+        portée.OPT_MODE_STRIP_AD_SEGMENTS = vrai;
+        portée.OPT_MODE_NOTIFY_ADS_WATCHED = vrai;
+        portée.OPT_MODE_NOTIFY_ADS_WATCHED_MIN_REQUESTS = faux;
+        portée.OPT_BACKUP_PLAYER_TYPE = 'lecture automatique';
+        portée.OPT_BACKUP_PLATFORM = 'ios';
+        portée.OPT_REGULAR_PLAYER_TYPE = 'site';
+        portée.OPT_ACCESS_TOKEN_PLAYER_TYPE = null;
+        portée.OPT_SHOW_AD_BANNER = vrai;
+        portée.AD_SIGNIFIER = 'publicité cousue';
+        portée.LIVE_SIGNIFIER = ',en direct';
+        portée.CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
+        // Ceux-ci ne concernent que la portée des travailleurs...
+        portée.StreamInfos = [];
+        portée.StreamInfosByUrl = [];
+        portée.CurrentChannelNameFromM3U8 = null;
+        // Nécessaire dans les deux portées. La portée de la fenêtre doit mettre à jour ceci dans la portée du travailleur.
+        portée.gql_device_id = null;
+        portée.ClientIntegrityHeader = null;
+        portée.AuthorizationHeader = null;
+    }
+    var twitchWorkers = [];
+    const oldWorker = fenêtre.Worker;
+    fonction hookWindowWorker() {
+        var newWorker = fenêtre.Worker = classe Worker étend oldWorker {
+            constructeur(twitchBlobUrl, options) {
+                var isTwitchWorker = false;
+                essayer {
+                    isTwitchWorker = nouvelle URL(twitchBlobUrl).origin.endsWith('.twitch.tv');
+                } attraper {}
+                si (newWorker.toString() !== fenêtre.Worker.toString()) {
+                    console.log('Plusieurs bloqueurs de publicités Twitch installés. Ignorer le hook Worker (video-swap-new)');
+                    isTwitchWorker = faux;
+                }
+                si (!isTwitchWorker) {
+                    super(twitchBlobUrl, options);
+                    retour;
+                }
+                var newBlobStr = `
+                    ${processM3U8.toString()}
+                    ${hookWorkerFetch.toString()}
+                    ${declareOptions.toString()}
+                    ${getAccessToken.toString()}
+                    ${gqlRequest.toString()}
+                    ${makeGraphQlPacket.toString()}
+                    ${tryNotifyAdsWatchedM3U8.toString()}
+                    ${parseAttributes.toString()}
+                    ${onFoundAd.toString()}
+                    ${getWasmWorkerUrl.toString()}
+                    var workerUrl = getWasmWorkerUrl('${twitchBlobUrl.replaceAll("'", "%27")}');
+                    si (workerUrl && workerUrl.includes('assets.twitch.tv/assets/amazon-ivs-wasmworker')) {
+                        déclarerOptions(self);
+                        self.addEventListener('message', fonction(e) {
+                            si (e.data.key == 'UboUpdateDeviceId') {
+                                gql_device_id = e.data.value;
+                            } sinon si (e.data.key == 'UpdateClientIntegrityHeader') {
+                                ClientIntegrityHeader = e.data.value;
+                            } sinon si (e.data.key == 'UpdateAuthorizationHeader') {
+                                AuthorizationHeader = e.data.value;
+                            }
+                        });
+                        hookWorkerFetch();
+                        importScripts(workerUrl);
+                    }
+                `
+                super(URL.createObjectURL(nouveau Blob([newBlobStr])), options);
+                twitchWorkers.push(ceci);
+                ceci.onmessage = fonction(e) {
+                    // REMARQUE : la mise en cache adDiv a été supprimée car « .video-player » peut changer entre les flux ?
+                    si (e.data.key == 'UboShowAdBanner') {
+                        var adDiv = getAdDiv();
+                        si (adDiv != null) {
+                            adDiv.P.textContent = 'Blocking' + (e.data.isMidroll ? 'midroll' : '') + 'ads';
+                            si (OPT_SHOW_AD_BANNER) {
+                                adDiv.style.display = 'bloc';
+                            }
+                        }
+                    } sinon si (e.data.key == 'UboHideAdBanner') {
+                        var adDiv = getAdDiv();
+                        si (adDiv != null) {
+                            adDiv.style.display = 'aucun';
+                        }
+                    } sinon si (e.data.key == 'UboChannelNameM3U8Changed') {
+                        //console.log('Le nom du canal M3U8 a été modifié en ' + e.data.value);
+                    } sinon si (e.data.key == 'UboReloadPlayer') {
+                        rechargerTwitchPlayer();
+                    } sinon si (e.data.key == 'UboPauseResumePlayer') {
+                        reloadTwitchPlayer(faux, vrai);
+                    } sinon si (e.data.key == 'UboSeekPlayer') {
+                        rechargerTwitchPlayer(true);
+                    }
+                }
+                fonction getAdDiv() {
+                    var playerRootDiv = document.querySelector('.video-player');
+                    var adDiv = null;
+                    si (playerRootDiv != null) {
+                        adDiv = playerRootDiv.querySelector('.ubo-overlay');
+                        si (adDiv == null) {
+                            adDiv = document.createElement('div');
+                            adDiv.className = 'ubo-overlay';
+                            adDiv.innerHTML = '<div class="player-ad-notice" style="color: white; background-color: rgba(0, 0, 0, 0.8); position: absolue; haut: 0px; gauche: 0px; remplissage: 5px;"><p></p></div>';
+                            adDiv.style.display = 'aucun';
+                            adDiv.P = adDiv.querySelector('p');
+                            playerRootDiv.appendChild(adDiv);
+                        }
+                    }
+                    retourner adDiv;
+                }
+            }
+        }
+    }
+    fonction getWasmWorkerUrl(twitchBlobUrl) {
+        var req = nouvelle XMLHttpRequest();
+        req.open('GET', twitchBlobUrl, false);
+        req.overrideMimeType("texte/javascript");
+        req.envoyer();
+        renvoyer req.responseText.split("'")[1];
+    }
+    fonction onFoundAd(streamInfo, textStr, reloadPlayer) {
+        console.log('Annonces trouvées, passer à la sauvegarde');
+        streamInfo.UseBackupStream = vrai;
+        streamInfo.IsMidroll = textStr.includes('"MIDROLL"') || textStr.includes('"midroll"');
+        si (reloadPlayer) {
+            postMessage({key:'UboReloadPlayer'});
+        }
+        postMessage({key:'UboShowAdBanner',isMidroll:streamInfo.IsMidroll});
+    }
+    fonction asynchrone processM3U8(url, textStr, realFetch) {
+        var streamInfo = StreamInfosByUrl[url];
+        si (streamInfo == null) {
+            console.log('URL de flux inconnue ' + url);
+            //postMessage({key:'UboHideAdBanner'});
+            retourner textStr;
+        }
+        si (!OPT_MODE_STRIP_AD_SEGMENTS) {
+            retourner textStr;
+        }
+        var haveAdTags = textStr.includes(AD_SIGNIFIER);
+        si (streamInfo.UseBackupStream) {
+            si (streamInfo.Encodings == null) {
+                console.log('Flux de sauvegarde trouvé mais pas de flux principal ?');
+                streamInfo.UseBackupStream = false;
+                postMessage({key:'UboReloadPlayer'});
+                retour '';
+            } autre {
+                var streamM3u8Url = streamInfo.Encodings.match(/^https:.*\.m3u8$/m)[0];
+                var streamM3u8Response = wait realFetch(streamM3u8Url);
+                si (streamM3u8Response.status == 200) {
+                    var streamM3u8 = wait streamM3u8Response.text();
+                    si (streamM3u8 != null) {
+                        si (!streamM3u8.includes(AD_SIGNIFIER)) {
+                            console.log('Plus de publicités sur le flux principal. Déclenchement du rechargement du lecteur pour revenir au flux principal...');
+                            streamInfo.UseBackupStream = false;
+                            postMessage({key:'UboHideAdBanner'});
+                            postMessage({key:'UboReloadPlayer'});
+                        } sinon si (!streamM3u8.includes('"MIDROLL"') && !streamM3u8.includes('"midroll"')) {
+                            var lignes = streamM3u8.replace('\r', '').split('\n');
+                            pour (var i = 0; i < lignes.length; i++) {
+                                var ligne = lignes[i];
+                                si (ligne.startsWith('#EXTINF') && lignes.length > i + 1) {
+                                    si (!line.includes(LIVE_SIGNIFIER) && !streamInfo.RequestedAds.has(lines[i + 1])) {
+                                        // Ne demandez qu'un seul fichier .ts par requête .m3u8 pour éviter de faire trop de requêtes
+                                        //console.log('Récupérer le fichier ad .ts');
+                                        streamInfo.RequestedAds.add(lignes[i + 1]);
+                                        récupérer(lignes[i + 1]).puis((réponse)=>{réponse.blob()});
+                                        casser;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } sinon si (haveAdTags) {
+            onFoundAd(streamInfo, textStr, true);
+        } autre {
+            postMessage({key:'UboHideAdBanner'});
+        }
+        si (haveAdTags && streamInfo.BackupEncodings != null) {
+            var streamM3u8Url = streamInfo.BackupEncodings.match(/^https:.*\.m3u8.*$/m)[0];
+            var streamM3u8Response = wait realFetch(streamM3u8Url);
+            si (streamM3u8Response.status == 200) {
+                textStr = attendez streamM3u8Response.text();
+            }
+        }
+        retourner textStr;
+    }
+    fonction hookWorkerFetch() {
+        console.log('hookWorkerFetch');
+        var realFetch = récupérer;
+        récupérer = fonction asynchrone (url, options) {
+            si (typeof url === 'chaîne') {
+                url = url.trimEnd();
+                si (url.endsWith('m3u8')) {
+                    renvoyer une nouvelle promesse (fonction (résoudre, rejeter) {
+                        var processAfter = fonction asynchrone (réponse) {
+                            var str = wait processM3U8(url, wait response.text(), realFetch);
+                            résoudre(nouvelle réponse(str, {
+                                statut : réponse.statut,
+                                statusText : réponse.statusText,
+                                en-têtes : response.headers
+                            }));
+                        };
+                        var envoyer = fonction() {
+                            renvoie realFetch(url, options).then(fonction(réponse) {
+                                processAfter(réponse);
+                            })['catch'](fonction(err) {
+                                console.log('récupérer le hook err ' + err);
+                                rejeter(err);
+                            });
+                        };
+                        envoyer();
+                    });
+                }
+                sinon si (url.includes('/api/channel/hls/') && !url.includes('image par image')) {
+                    var channelName = (nouvelle URL(url)).pathname.match(/([^\/]+)(?=\.\w+$)/)[0];
+                    si (CurrentChannelNameFromM3U8 != channelName) {
+                        messageposter({
+                            clé : « UboChannelNameM3U8Changed »,
+                            valeur : channelName
+                        });
+                    }
+                    CurrentChannelNameFromM3U8 = nomducanal;
+                    si (OPT_MODE_STRIP_AD_SEGMENTS) {
+                        renvoyer une nouvelle promesse (fonction asynchrone (résoudre, rejeter) {
+                            // - La première requête m3u8 est le m3u8 avec les encodages vidéo (360p, 480p, 720p, etc.).
+                            // - La deuxième requête m3u8 est le m3u8 pour l'encodage donné obtenu dans la première requête. À ce stade, nous saurons s'il y a des publicités.
+                            var streamInfo = StreamInfos[nom du canal];
+                            si (streamInfo != null && streamInfo.Encodings != null && (attendre realFetch(streamInfo.Encodings.match(/^https:.*\.m3u8$/m)[0])).status !== 200) {
+                                // Les encodages mis en cache sont morts (le flux a probablement redémarré)
+                                streamInfo = null;
+                            }
+                            si (streamInfo == null || streamInfo.Encodings == null || streamInfo.BackupEncodings == null) {
+                                StreamInfos[nom du canal] = streamInfo = {
+                                    RequestedAds : nouveau Set(),
+                                    Codages : null,
+                                    Codages de sauvegarde : null,
+                                    IsMidroll : faux,
+                                    UseBackupStream : faux,
+                                    Nom de la chaîne : nom de la chaîne
+                                };
+                                pour (var i = 0; i < 2; i++) {
+                                    var encodingsUrl = url;
+                                    si (i == 1) {
+                                        var accessTokenResponse = wait getAccessToken(channelName, OPT_BACKUP_PLAYER_TYPE, OPT_BACKUP_PLATFORM, realFetch);
+                                        si (accessTokenResponse != null && accessTokenResponse.status === 200) {
+                                            var accessToken = wait accessTokenResponse.json();
+                                            var urlInfo = nouvelle URL('https://usher.ttvnw.net/api/channel/hls/' + channelName + '.m3u8' + (nouvelle URL(url)).search);
+                                            urlInfo.searchParams.set('sig', accessToken.data.streamPlaybackAccessToken.signature);
+                                            urlInfo.searchParams.set('token', accessToken.data.streamPlaybackAccessToken.value);
+                                            encodingsUrl = urlInfo.href;
+                                        } autre {
+                                            résoudre(accessTokenResponse);
+                                            retour;
+                                        }
+                                    }
+                                    var encodingsM3u8Response = wait realFetch(encodingsUrl, options);
+                                    si (encodingsM3u8Response != null && encodingsM3u8Response.status === 200) {
+                                        var encodingsM3u8 = wait encodingsM3u8Response.text();
+                                        si (i == 0) {
+                                            streamInfo.Encodings = encodingsM3u8;
+                                            var streamM3u8Url = encodingsM3u8.match(/^https:.*\.m3u8$/m)[0];
+                                            var streamM3u8Response = wait realFetch(streamM3u8Url);
+                                            si (streamM3u8Response.status == 200) {
+                                                var streamM3u8 = wait streamM3u8Response.text();
+                                                si (streamM3u8.includes(AD_SIGNIFIER)) {
+                                                    onFoundAd(streamInfo, streamM3u8, false);
+                                                }
+                                            } autre {
+                                                résoudre(streamM3u8Response);
+                                                retour;
+                                            }
+                                        } autre {
+                                            var lowResLines = encodingsM3u8.replace('\r', '').split('\n');
+                                            var lowResBestUrl = null;
+                                            pour (var j = 0; j < lowResLines.length; j++) {
+                                                si (lowResLines[j].startsWith('#EXT-X-STREAM-INF')) {
+                                                    var res = parseAttributes(lowResLines[j])['RÉSOLUTION'];
+                                                    si (res && lowResLines[j + 1].endsWith('.m3u8')) {
+                                                        // Suppose que les résolutions sont correctement ordonnées
+                                                        lowResBestUrl = lowResLines[j + 1];
+                                                        casser;
+                                                    }
+                                                }
+                                            }
+                                            si (lowResBestUrl != null && streamInfo.Encodings != null) {
+                                                var normalEncodingsM3u8 = streamInfo.Encodings;
+                                                var normalLines = normalEncodingsM3u8.replace('\r', '').split('\n');
+                                                pour (var j = 0; j < normalLines.length - 1; j++) {
+                                                    si (normalLines[j].startsWith('#EXT-X-STREAM-INF')) {
+                                                        var res = parseAttributes(normalLines[j])['RÉSOLUTION'];
+                                                        si (rés) {
+                                                            lowResBestUrl += ' ';// Le flux ne se charge pas à moins que chaque ligne d'URL soit unique
+                                                            normalLines[j + 1] = lowResBestUrl;
+                                                        }
+                                                    }
+                                                }
+                                                encodagesM3u8 = normalLines.join('\r\n');
+                                            }
+                                            streamInfo.BackupEncodings = encodagesM3u8;
+                                        }
+                                        var lignes = encodagesM3u8.replace('\r', '').split('\n');
+                                        pour (var j = 0; j < lignes.length; j++) {
+                                            si (!lines[j].startsWith('#') && lines[j].includes('.m3u8')) {
+                                                StreamInfosByUrl[lignes[j].trimEnd()] = streamInfo;
+                                            }
+                                        }
+                                    } autre {
+                                        résoudre(encodagesM3u8Response);
+                                        retour;
+                                    }
+                                }
+                            }
+                            si (streamInfo.UseBackupStream) {
+                                résoudre(nouvelle réponse(streamInfo.BackupEncodings));
+                            } autre {
+                                résoudre(nouvelle réponse(streamInfo.Encodings));
+                            }
+                        });
+                    }
+                }
+            }
+            renvoie realFetch.apply(this, arguments);
+        }
+    }
+    fonction makeGraphQlPacket(événement, radToken, charge utile) {
+        retour [{
+            Nom de l'opération : « ClientSideAdEventHandling_RecordAdEvent »,
+            variables : {
+                saisir: {
+                    eventName: événement,
+                    eventPayload : JSON.stringify(charge utile),
+                    jeton rad,
+                },
+            },
+            extensions: {
+                requête persistante : {
+                    version: 1,
+                    sha256Hash : '7e6c69e6eb59f8ccb97ab73686f3d8b7d85a72a0298745ccd8bfc68e4054ca5b',
+                },
+            },
+        }];
+    }
+    fonction getAccessToken(channelName, playerType, plateforme, realFetch) {
+        si (!plate-forme) {
+            plateforme = 'web';
+        }
+        var corps = null;
+        var templateQuery = 'query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: "' + platform + '", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isLive) { value signature __typename } videoPlaybackAccessToken(id: $vodID, params: {platform: "' + platform + '", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isVod) { value signature __typename }}';
+        corps = {
+            operationName : « PlaybackAccessToken_Template »,
+            requête : templateQuery,
+            variables : {
+                'isLive': vrai,
+                'login': nom du canal,
+                'isVod': faux,
+                'vodID': '',
+                'playerType': Type de joueur
+            }
+        };
+        retourner gqlRequest(corps, realFetch);
+    }
+    fonction gqlRequest(corps, realFetch) {
+        si (ClientIntegrityHeader == null) {
+            //console.warn('ClientIntegrityHeader est nul');
+            //throw 'ClientIntegrityHeader est null';
+        }
+        var fetchFunc = realFetch ? realFetch : fetch;
+        renvoie fetchFunc('https://gql.twitch.tv/gql', {
+            méthode : 'POST',
+            corps : JSON.stringify(corps),
+            en-têtes : {
+                'ID client' : CLIENT_ID,
+                « Client-Integrity » : ClientIntegrityHeader,
+                « Identifiant du périphérique X » : gql_device_id,
+                « Autorisation » : AuthorizationHeader
+            }
+        });
+    }
+    fonction parseAttributes(str) {
+        renvoie l'objet.fromEntries(
+            str.split(/(?:^|,)((?:[^=]*)=(?:"[^"]*"|[^,]*))/)
+                .filter(booléen)
+                .carte(x => {
+                    const idx = x.indexOf('=');
+                    const clé = x.substring(0, idx);
+                    valeur const = x.substring(idx +1);
+                    const num = Nombre(valeur);
+                    retourner [clé, Number.isNaN(num) ? value.startsWith('"') ? JSON.parse(value) : value : num]
+                }));
+    }
+    fonction asynchrone tryNotifyAdsWatchedM3U8(streamM3u8) {
+        essayer {
+            //console.log(streamM3u8);
+            si (!streamM3u8 || !streamM3u8.includes(AD_SIGNIFIER)) {
+                retour 1;
+            }
+            var correspondances = streamM3u8.match(/#EXT-X-DATERANGE:(ID="annonce-stitched-[^\n]+)\n/);
+            si (matches.length > 1) {
+                const attrString = matches[1];
+                const attr = parseAttributes(attrString);
+                var podLength = parseInt(attr['X-TV-TWITCH-AD-POD-LENGTH'] ? attr['X-TV-TWITCH-AD-POD-LENGTH'] : '1');
+                var podPosition = parseInt(attr['X-TV-TWITCH-AD-POD-POSITION'] ? attr['X-TV-TWITCH-AD-POD-POSITION'] : '0');
+                var radToken = attr['X-TV-TWITCH-AD-RADS-TOKEN'];
+                var lineItemId = attr['ID-DE-LIGNE-D'ARTICLE-AD-X-TV-TWITCH'];
+                var orderId = attr['ID-ORDRE-AD-X-TV-TWITCH'];
+                var creativeId = attr['X-TV-TWITCH-AD-CREATIVE-ID'];
+                var adId = attr['X-TV-TWITCH-AD-ADVERTISER-ID'];
+                var rollType = attr['X-TV-TWITCH-AD-ROLL-TYPE'].toLowerCase();
+                const baseData = {
+                    cousu : vrai,
+                    roll_type: type_rouleau,
+                    player_mute: faux,
+                    volume_du_lecteur : 0,5,
+                    visible : vrai,
+                };
+                pour (laissez podPosition = 0; podPosition < podLength; podPosition++) {
+                    si (OPT_MODE_NOTIFY_ADS_WATCHED_MIN_REQUESTS) {
+                        // C'est tout ce qui est réellement nécessaire pour le moment
+                        attendez gqlRequest(makeGraphQlPacket('video_ad_pod_complete', radToken, baseData));
+                    } autre {
+                        const extendedData = {
+                            ...données de base,
+                            ad_id : identifiant de l'annonce,
+                            ad_position : podPosition,
+                            durée: 30,
+                            creative_id : identifiant créatif,
+                            total_ads : longueur du pod,
+                            order_id : ID de la commande,
+                            line_item_id : lineItemId,
+                        };
+                        attendez gqlRequest(makeGraphQlPacket('video_ad_impression', radToken, extendedData));
+                        pour (soit quartile = 0; quartile < 4; quartile++) {
+                            attendre gqlRequest(
+                                makeGraphQlPacket('vidéo_annonce_quartile_complete', radToken, {
+                                    ...données étendues,
+                                    quartile : quartile + 1,
+                                })
+                            );
+                        }
+                        attendez gqlRequest(makeGraphQlPacket('video_ad_pod_complete', radToken, baseData));
+                    }
+                }
+            }
+            retourner 0;
+        } attraper (errer) {
+            console.log(err);
+            retourner 0;
+        }
+    }
+    fonction postTwitchWorkerMessage(clé, valeur) {
+        twitchWorkers.forEach((travailleur) => {
+            worker.postMessage({clé : clé, valeur : valeur});
+        });
+    }
+    fonction hookFetch() {
+        var realFetch = fenêtre.fetch;
+        fenêtre.fetch = fonction(url, init, ...args) {
+            si (typeof url === 'chaîne') {
+                si (url.includes('gql')) {
+                    var deviceId = init.headers['X-Device-Id'];
+                    si (typeof deviceId !== 'chaîne') {
+                        deviceId = init.headers['ID de l'appareil'];
+                    }
+                    si (typeof deviceId === 'chaîne') {
+                        gql_device_id = identifiant de l'appareil;
+                    }
+                    si (gql_device_id) {
+                        postTwitchWorkerMessage('UboUpdateDeviceId', gql_device_id);
+                    }
+                    si (typeof init.body === 'chaîne' && init.body.includes('PlaybackAccessToken')) {
+                        si (OPT_ACCESS_TOKEN_PLAYER_TYPE) {
+                            const newBody = JSON.parse(init.body);
+                            si (Array.isArray(newBody)) {
+                                pour (soit i = 0; i < newBody.length; i++) {
+                                    newBody[i].variables.playerType = OPT_ACCESS_TOKEN_PLAYER_TYPE;
+                                }
+                            } autre {
+                                newBody.variables.playerType = OPT_ACCESS_TOKEN_PLAYER_TYPE;
+                            }
+                            init.body = JSON.stringify(nouveauBody);
+                        }
+                        si (typeof init.headers['Client-Integrity'] === 'chaîne') {
+                            ClientIntegrityHeader = init.headers['Client-Integrity'];
+                            si (ClientIntegrityHeader) {
+                                postTwitchWorkerMessage('UpdateClientIntegrityHeader', init.headers['Client-Integrity']);
+                            }
+                        }
+                        si (typeof init.headers['Autorisation'] === 'chaîne') {
+                            AuthorizationHeader = init.headers['Autorisation'];
+                            si (En-tête d'autorisation) {
+                                postTwitchWorkerMessage('UpdateAuthorizationHeader', init.headers['Autorisation']);
+                            }
+                        }
+                    }
+                }
+            }
+            renvoie realFetch.apply(this, arguments);
+        };
+    }
+    fonction reloadTwitchPlayer(isSeek, isPausePlay) {
+        // Extrait de ttv-tools/ffz
+        // https://github.com/Nerixyz/ttv-tools/blob/master/src/context/twitch-player.ts
+        // https://github.com/FrankerFaceZ/FrankerFaceZ/blob/master/src/sites/twitch-twilight/modules/player.jsx
+        fonction findReactNode(racine, contrainte) {
+            si (root.stateNode && contrainte(root.stateNode)) {
+                retourner root.stateNode;
+            }
+            laissez le nœud = racine.enfant;
+            pendant que (nœud) {
+                const result = findReactNode(nœud, contrainte);
+                si (résultat) {
+                    retourner le résultat;
+                }
+                nœud = nœud.sibling;
+            }
+            retourner null;
+        }
+        fonction findReactRootNode() {
+            var reactRootNode = null;
+            var rootNode = document.querySelector('#root');
+            si (rootNode && rootNode._reactRootContainer && rootNode._reactRootContainer._internalRoot && rootNode._reactRootContainer._internalRoot.current) {
+                reactRootNode = rootNode._reactRootContainer._internalRoot.current;
+            }
+            si (reactRootNode == null) {
+                var containerName = Objet.keys(rootNode).find(x => x.startsWith('__reactContainer'));
+                si (containerName != null) {
+                    reactRootNode = rootNode[nom du conteneur];
+                }
+            }
+            retourner reactRootNode;
+        }
+        var réagirRootNode = findReactRootNode();
+        si (!reactRootNode) {
+            console.log('Impossible de trouver la racine React');
+            retour;
+        }
+        var player = findReactNode(reactRootNode, node => node.setPlayerActive && node.props && node.props.mediaPlayerInstance);
+        joueur = joueur && joueur.props && joueur.props.mediaPlayerInstance ? joueur.props.mediaPlayerInstance : null;
+        var playerState = findReactNode(reactRootNode, node => node.setSrc && node.setInitialPlaybackSettings);
+        si (!joueur) {
+            console.log('Impossible de trouver le joueur');
+            retour;
+        }
+        si (!playerState) {
+            console.log('Impossible de trouver l'état du joueur');
+            retour;
+        }
+        si (joueur.en pause || joueur.core?.en pause) {
+            retour;
+        }
+        si (isSeek) {
+            console.log('Forcer la recherche pour réinitialiser le lecteur (en espérant corriger toute désynchronisation audio) pos:' + player.getPosition() + ' range:' + JSON.stringify(player.getBuffered()));
+            var pos = joueur.getPosition();
+            joueur.seekTo(0);
+            joueur.seekTo(pos);
+            retour;
+        }
+        si (isPausePlay) {
+            joueur.pause();
+            joueur.play();
+            retour;
+        }
+        const lsKeyQuality = 'qualité-vidéo';
+        const lsKeyMuted = 'vidéo coupée';
+        const lsKeyVolume = 'volume';
+        var currentQualityLS = localStorage.getItem(lsKeyQuality);
+        var currentMutedLS = localStorage.getItem(lsKeyMuted);
+        var currentVolumeLS = localStorage.getItem(lsKeyVolume);
+        si (joueur?.core?.state) {
+            localStorage.setItem(lsKeyMuted, JSON.stringify({par défaut : player.core.state.muted}));
+            localStorage.setItem(lsKeyVolume, player.core.state.volume);
+        }
+        si (joueur?.core?.state?.quality?.group) {
+            localStorage.setItem(lsKeyQuality, JSON.stringify({par défaut : player.core.state.quality.group}));
+        }
+        playerState.setSrc({ isNewMediaPlayerInstance: true, refreshAccessToken: true });
+        setTimeout(() => {
+            localStorage.setItem(lsKeyQuality, currentQualityLS);
+            localStorage.setItem(lsKeyMuted, currentMutedLS);
+            localStorage.setItem(lsKeyVolume, currentVolumeLS);
+        }, 3000);
+    }
+    fonction onContentLoaded() {
+        // Cela empêche Twitch de mettre le joueur en pause lorsqu'il est dans un autre onglet et qu'une publicité s'affiche.
+        // Extrait de https://github.com/saucettv/VideoAdBlockForTwitch/blob/cefce9d2b565769c77e3666ac8234c3acfe20d83/chrome/content.js#L30
+        essayer {
+            Objet.defineProperty(document, 'visibilityState', {
+                obtenir() {
+                    retourner 'visible';
+                }
+            });
+        }attraper{}
+        essayer {
+            Objet.defineProperty(document, 'caché', {
+                obtenir() {
+                    retourner faux;
+                }
+            });
+        }attraper{}
+        var bloc = e => {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+        };
+        document.addEventListener('visibilitychange', bloc, vrai);
+        document.addEventListener('webkitvisibilitychange', bloc, vrai);
+        document.addEventListener('mozvisibilitychange', bloc, vrai);
+        document.addEventListener('hasFocus', bloc, vrai);
+        essayer {
+            si (/Firefox/.test(navigator.userAgent)) {
+                Objet.defineProperty(document, 'mozHidden', {
+                    obtenir() {
+                        retourner faux;
+                    }
+                });
+            } autre {
+                Objet.defineProperty(document, 'webkitHidden', {
+                    obtenir() {
+                        retourner faux;
+                    }
+                });
+            }
+        }attraper{}
+        // Crochets pour préserver le volume / la résolution
+        var clésToCache = [
+            « qualité vidéo »,
+            « vidéo coupée »,
+            'volume',
+            'lowLatencyModeEnabled',// Faible latence
+            'persistenceEnabled',// Mini-lecteur
+        ];
+        var cachedValues ​​= nouvelle carte();
+        pour (var i = 0; i < keysToCache.length; i++) {
+            cachedValues.set(keysToCache[i], localStorage.getItem(keysToCache[i]));
+        }
+        var realSetItem = localStorage.setItem;
+        localStorage.setItem = fonction(clé, valeur) {
+            si (cachedValues.has(clé)) {
+                cachedValues.set(clé, valeur);
+            }
+            realSetItem.apply(ceci, arguments);
+        };
+        var realGetItem = localStorage.getItem;
+        localStorage.getItem = fonction(clé) {
+            si (cachedValues.has(clé)) {
+                renvoie cachedValues.get(clé);
+            }
+            renvoie realGetItem.apply(this, arguments);
+        };
+    }
+    si (window.Worker.toString().includes('twitch')) {
+        console.log('Twitch Worker est déjà accroché');
+    } autre {
+        fenêtre.reloadTwitchPlayer = reloadTwitchPlayer;
+        déclarerOptions(fenêtre);
+        hookWindowWorker();
+        crochetFetch();
+        si (document.readyState === "complet" || document.readyState === "chargé" || document.readyState === "interactif") {
+            surContenuChargé();
+        } autre {
+            fenêtre.addEventListener("DOMContentLoaded", fonction() {
+                surContenuChargé();
+            });
+        }
+    }
+})();
